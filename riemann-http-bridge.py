@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import json
+import fcntl
 import optparse
 
 import bottle
@@ -29,46 +30,38 @@ riemann = bernhard.Client(host=options.riemann_host, port=options.riemann_port, 
 
 bridge = bottle.Bottle()
 
+pidpath = './bridge.pid'
 
-def alive(pid):
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    else:
-        return True
+class PidFile(object):
+    """Context manager that locks a pid file.  Implemented as class
+    not generator because daemon.py is calling .__exit__() with no parameters
+    instead of the None, None, None specified by PEP-343."""
 
+    def __init__(self, path):
+        self.path = path
+        self.pidfile = None
 
-def pidfile(directory=".", create=False, delete=False):
-    if create and delete:
-        raise ValueError("Cannot both 'create' and 'delete' PID")
+    def __enter__(self):
+        self.pidfile = open(self.path, "a+")
+        try:
+            fcntl.flock(self.pidfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError:
+            raise SystemExit("Already running according to " + self.path)
+        self.pidfile.seek(0)
+        self.pidfile.truncate()
+        self.pidfile.write(str(os.getpid()))
+        self.pidfile.flush()
+        self.pidfile.seek(0)
+        return self.pidfile
 
-    pidpath = os.path.join(directory, 'bridge.pid')
-    exists = os.path.isfile(pidpath)
-
-    if exists:
-        with open(pidpath, 'r') as pid:
-            pid = int(pid.read())
- 
-        if create and alive(pid):
-            raise IOError("%s already exists!" % (pidpath))
-        elif delete:
-            os.unlink(pidpath)
-        elif create:
-            with open(pidpath, 'w') as pid:
-                pid.write(str(os.getpid()))
-            return os.getpid()
-        else:
-            return pid
-    else:
-        if create:
-            with open(pidpath, 'w') as pid:
-                pid.write(str(os.getpid()))
-            return os.getpid()
-        elif delete:
-            raise IOError("%s does not exist!" % (pidpath))
-        else:
-            return False
+    def __exit__(self, exc_type=None, exc_value=None, exc_tb=None):
+        try:
+            self.pidfile.close()
+        except IOError as err:
+            # ok if file was just closed elsewhere
+            if err.errno != 9:
+                raise
+        os.remove(self.path)
 
 
 @bridge.get('/ping')
@@ -110,25 +103,12 @@ if __name__ == "__main__":
             bridge.run(host='0.0.0.0', port=options.local_port, debug=options.debug, reloader=options.debug)
         else:
             try:
-                with daemon.DaemonContext(working_directory="."):
-                    pidfile(create=True)
+                with daemon.DaemonContext(working_directory=".", pidfile=PidFile(pidpath)):
                     bridge.run(host='0.0.0.0', port=options.local_port, debug=options.debug, reloader=options.debug)
-            except Exception as e:
+            except (Exception, SystemExit) as e:
                 with open(os.path.join(options.log_directory, 'bridge.log'), 'a+') as fh:
-                    fh.write(str(e))
-
+                    fh.write(str(e) + "\n")
     elif 'stop' in args:
-        pid = pidfile()
-
-        if pid and alive(pid):
-            try:
-                os.kill(pid, 15)
-                pidfile(delete=True)
-                print "Killed monitoring-bridge (%s)" % (pid)
-            except Exception as e:
-                print "Unable to kill %s: %s" % (pidfile(), str(e))
-        elif pid:
-            pidfile(delete=True)
-        else:
-            print "No such process or PID"
-            sys.exit(0)
+        with open(pidpath) as ph:
+            pid = ph.read()
+            os.kill(pid, 15)
