@@ -109,6 +109,12 @@ if __name__ == "__main__":
                 with open(os.path.join(options.log_directory, 'bridge.log'), 'a+') as fh:
                     fh.write(str(e) + "\n")
     elif 'stop' in args:
-        with open(pidpath) as ph:
-            pid = ph.read()
-            os.kill(pid, 15)
+        try:
+            with open(pidpath) as ph:
+                pid = ph.read()
+                os.kill(int(pid), 15)
+        except IOError as e:
+            if e.errno == 2:
+                raise SystemExit("Pidfile not found - is the process running?")
+            else:
+                raise e
